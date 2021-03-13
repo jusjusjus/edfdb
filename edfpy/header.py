@@ -3,8 +3,9 @@ import logging
 import numpy as np
 from os import SEEK_SET
 from struct import Struct
-from .notation import Label, convert_units
+from .notation import Label, convert_units, AnnotationsLabel
 from datetime import datetime
+from collections import namedtuple
 
 
 default_dtype = np.float32
@@ -162,35 +163,36 @@ class Header:
             values = Struct(_format_str).unpack(data)
             normalized = (self.normalize(typ, v) for v in values)
             for c, v in zip(channels, normalized):
-                setattr(c, field, v)
+                try:
+                    getattr(type(c), field).fset(c, v)
+                except AttributeError:
+                    setattr(c, field, v)
             offset += num_bytes
         assert offset == self.num_header_bytes, f" \
             invalid header of size {offset} [{self.num_header_bytes}]"
 
+        self.channels = [c.transform_from_label() for c in channels]
+
         # Add some redundance for fast access
         for key in ('record_duration', 'num_records'):
             att = getattr(self, key)
-            for channel in channels:
+            for channel in self.channels:
                 setattr(channel, key, att)
 
-        self.channels = channels
         self.samples_by_channel = np.array([
-            channel.num_samples
-            for channel in self.channels
+            c.num_samples for c in self.channels
         ])
         self.samples_per_record_by_channel = np.array([
-            channel.num_samples_per_record
-            for channel in self.channels
+            c.num_samples_per_record for c in self.channels
         ])
         self.sampling_rates = np.array([
-            channel.sampling_rate
-            for channel in self.channels
+            c.sampling_rate for c in self.channels
         ])
         self.sampling_rate_by_label = {
-            channel.label: channel.sampling_rate
-            for channel in self.channels
+            c.label: c.sampling_rate
+            for c in self.channels
         }
-        self.channel_by_label = {c.label: c for c in channels}
+        self.channel_by_label = {c.label : c for c in self.channels}
 
     def set_blob(self, fo):
         pass
@@ -317,11 +319,6 @@ class ChannelHeader:
             typically the reference index in a data blob.
         """
         self.specifier = specifier
-        self._sampling_rate = None
-        self._num_samples = None
-        self._offset = None
-        self._scale = None
-        self._output_physical_dimension = None
         self.unit_scale = 1.0
 
     @property
@@ -330,22 +327,33 @@ class ChannelHeader:
 
     @label.setter
     def label(self, v):
-        if not isinstance(v, Label):
-            v = Label(v.strip())
-        self._label = v
+        self._label = v if isinstance(v, Label) else Label(v.strip())
+
+    def transform_from_label(self):
+        if isinstance(self.label, AnnotationsLabel):
+            return AnnotChannelHeader.from_channelheader(self)
+        return self
 
     @property
     def sampling_rate(self):
-        if self._sampling_rate is None:
-            self._sampling_rate = self.num_samples_per_record / \
-                                  self.record_duration  # ignore: type
-        return self._sampling_rate
+        try:
+            return self._sampling_rate
+        except AttributeError:
+            self._sampling_rate = self.num_samples_per_record / self.record_duration
+            return self._sampling_rate
+    
+    def digital2physical(self, data, dtype=default_dtype, specifier=None):
+        s = self.specifier if specifier is None else specifier
+        assert s is not None, "channel index for edf record column missing"
+        return dtype(self.unit_scale)*dtype(self.scale)*(data[s].astype(dtype) + dtype(self.offset))
 
     @property
     def num_samples(self):
-        if self._num_samples is None:
+        try:
+            return self._num_samples
+        except AttributeError:
             self._num_samples = self.num_samples_per_record * self.num_records
-        return self._num_samples
+            return self._num_samples
 
     @property
     def channel_type(self):
@@ -353,7 +361,7 @@ class ChannelHeader:
 
     @channel_type.setter
     def channel_type(self, v):
-        self._channel_type = v
+        self._channel_type = v.strip()
 
     @property
     def type(self):
@@ -370,9 +378,10 @@ class ChannelHeader:
 
     @property
     def output_physical_dimension(self):
-        return self._output_physical_dimension \
-               if self._output_physical_dimension \
-               else self.physical_dimension
+        try:
+            return self._output_physical_dimension
+        except AttributeError:
+            return self.physical_dimension
 
     @output_physical_dimension.setter
     def output_physical_dimension(self, v):
@@ -386,7 +395,7 @@ class ChannelHeader:
 
     @prefiltering.setter
     def prefiltering(self, v):
-        self._prefiltering = v
+        self._prefiltering = v.strip()
 
     @property
     def reserved(self):
@@ -394,21 +403,24 @@ class ChannelHeader:
 
     @reserved.setter
     def reserved(self, v):
-        self._reserved = v
+        self._reserved = v.strip()
 
     @property
     def scale(self):
-        if self._scale is None:
-            self._scale = (self.physical_maximum - self.physical_minimum) / \
-                (self.digital_maximum - self.digital_minimum)
-        return self._scale
-
+        try:
+            return self._scale
+        except AttributeError:
+            self._scale  = (self.physical_maximum - self.physical_minimum) / \
+                           (self.digital_maximum  - self.digital_minimum)
+            return self._scale
+    
     @property
     def offset(self):
-        if self._offset is None:
-            self._offset = self.physical_maximum / self.scale \
-                           - self.digital_maximum  # pyright: disable
-        return self._offset
+        try:
+            return self._offset
+        except AttributeError:
+            self._offset = self.physical_maximum / self.scale - self.digital_maximum
+            return self._offset
 
     def digital2physical(self, data, dtype=default_dtype, specifier=None):
         s = self.specifier if specifier is None else specifier
@@ -491,3 +503,146 @@ class ChannelDifference:
     def output_physical_dimension(self, v):
         self.left.output_physical_dimension = v
         self.right.output_physical_dimension = v
+
+
+_Annotation = namedtuple('Annotation', 't dt label')
+
+class Annotation(_Annotation):
+    @classmethod
+    def to_pandas(cls, annotations):
+        """Given a list of `Annotation` returns a pd.DataFrame of these."""
+        import pandas as pd
+        if all(isinstance(a, cls) for a in annotations):
+            annotations = cls(*zip(*annotations))
+        return pd.DataFrame.from_items([
+            (p, getattr(annotations, p))
+            for p in ('t', 'dt', 'label')
+        ])
+
+class AnnotChannelHeader(ChannelHeader):
+
+    logger = logging.getLogger(name='AnnotChannelHeader')
+
+    @classmethod
+    def from_channelheader(cls, header):
+        ans = cls(header.specifier)
+        for field in ('label', 'num_samples_per_record', 'reserved'):
+            val = getattr(header, field)
+            try:
+                getattr(type(ans), field).fset(val)
+            except:
+                setattr(ans, field, val)
+        return ans
+
+    def __init__(self, specifier):
+        """
+        Arguments:
+            specifier (optional) : specifies the channel construction,
+            typically the reference index in a data blob.
+        """
+        self.specifier = specifier
+        self.unit_scale = 1.0
+
+    @property
+    def label(self):
+        return self._label
+
+    @label.setter
+    def label(self, v):
+        self._label = v if isinstance(v, Label) else Label(v.strip())
+
+    @property
+    def sampling_rate(self):
+        try:
+            return self._sampling_rate
+        except AttributeError:
+            self._sampling_rate = self.num_samples_per_record / self.record_duration
+            return self._sampling_rate
+
+    @property
+    def num_samples(self):
+        try:
+            return self._num_samples
+        except AttributeError:
+            self._num_samples = self.num_samples_per_record * self.num_records
+            return self._num_samples
+
+    @property
+    def channel_type(self):
+        return self._channel_type
+    
+    @channel_type.setter
+    def channel_type(self, v):
+        self._channel_type = v
+
+    @property
+    def type(self):
+        """channel type from label"""
+        return self.label.type
+
+    @property
+    def reserved(self):
+        return self._reserved
+
+    @reserved.setter
+    def reserved(self, v):
+        self._reserved = v
+
+    _processor = {
+        2: lambda x: None,
+        3: lambda x: Annotation(float(x[0]), float(x[1]), x[2].decode('ascii'))
+    }
+
+    _dt_annot_sep = b'\x14'
+    _t_dt_sep = b'\x15'
+    @classmethod
+    def _process_annot(cls, x):
+        # x = b'+0.0\x14'
+        # or
+        # x = b'+17.448\x150.001\x14Resting Eyes Open'
+        x = x.split(cls._dt_annot_sep)
+        x = x[0].split(cls._t_dt_sep) + [x[-1]]
+        x = cls._processor[len(x)](x)
+        return x
+
+    _annot_sep = b'\x14\x00'
+    def digital2physical(self, data, dtype=default_dtype, specifier=None):
+        """Convert int16 data stream to list of `Annotation` objects.
+        
+        (the method name is a bit of a misnomer.)
+        """
+        s = self.specifier if specifier is None else specifier
+        assert s is not None, "channel index for edf record column missing"
+        x = data[s].tobytes()
+        # x = b'+0.0\x14\x14\x00+17.448\x150.001\x14Resting Eyes Open\x14\x00\x0..'
+        x = x.split(self._annot_sep)
+        # x = [b'+0.0\x14', b'+17.448\x150.001\x14Resting Eyes Open', b'\x00\x00\x0..', ..]
+        return [a for a in map(self._process_annot, x) if a is not None]
+
+    def as_bytes(self, key, num_bytes=None):
+        """Converts the `str` representation of value `self.key` to a `bytes` instance."""
+        fstring = "{:<%i}"%num_bytes if num_bytes else "{}"
+        return bytes(fstring.format(getattr(self, key)), 'latin1')
+
+    def to_bytes(self, key):
+        att = getattr(self, key)
+        b = bytes(att, 'latin1') if typ is str else bytes(att)
+        return b
+
+    def to_string_list(self):
+        return [
+            "{}: {}".format(key, val)
+            for key, val in self.__dict__.items()
+        ]
+
+    def __str__(self):
+        return '\n'.join(self.to_string_list())
+
+    def _repr_html_(self):
+        return ''.join(['<p>%s</p>'%s for s in self.to_string_list()])
+
+    def check_compatible(self, other):
+        raise TypeError("Annotations channel not compatible")
+
+    def __sub__(self, other):
+        raise NotImplementedError("Cannot subtract annotations channel.")
